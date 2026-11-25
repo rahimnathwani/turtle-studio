@@ -1,0 +1,17 @@
+{
+  "name": "Turtle Studio",
+  "short_name": "Turtle Studio",
+  "description": "Draw glowing geometry, fractals, and animations with tactile code blocks.",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#101626",
+  "theme_color": "#12182b",
+  "icons": [
+    {
+      "src": "./icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
