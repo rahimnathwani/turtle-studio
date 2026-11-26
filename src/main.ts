@@ -40,11 +40,15 @@ let undoStack: ProgramDoc[] = [];
 let redoStack: ProgramDoc[] = [];
 let idSeq = 1;
 
-// Animation state
-let drawLimit: number | null = null; // null = draw all segments immediately
+// Animation & run state
+let drawLimit: number | null = null; // null = draw all segments of active run
 let animFrame = 0;
 let spinAngle = 0;
 let spinHue = 0;
+let lastRunDoc: ProgramDoc | null = null; // In puzzle mode, canvas only draws after tapping Run
+let dirty = false;
+let pendingCheck = false;
+let runCount = 0;
 
 function nextId(): string {
   return `b${Date.now().toString(36)}${idSeq++}`;
@@ -106,8 +110,8 @@ function targetSegments(): Segment[] {
   ).segments;
 }
 
-function currentRun(angleOffset = 0, hueOffset = 0) {
-  return executeProgram(doc, {
+function runDoc(program: ProgramDoc, angleOffset = 0, hueOffset = 0) {
+  return executeProgram(program, {
     startX: level.startX,
     startY: level.startY,
     startAngle: level.startAngle,
@@ -116,11 +120,21 @@ function currentRun(angleOffset = 0, hueOffset = 0) {
   });
 }
 
-function currentMatch(): MatchResult | null {
-  if (level.sandbox || !level.targetProgram) return null;
-  const drawn = currentRun().segments;
+function currentRun(angleOffset = 0, hueOffset = 0) {
+  return runDoc(doc, angleOffset, hueOffset);
+}
+
+function lastRunMatch(): MatchResult | null {
+  if (level.sandbox || !level.targetProgram || !lastRunDoc) return null;
+  const drawn = runDoc(lastRunDoc).segments;
   const target = targetSegments();
   return matchDrawing(drawn, target);
+}
+
+function markEdited(): void {
+  drawLimit = null;
+  pendingCheck = false;
+  if (!level.sandbox) dirty = true;
 }
 
 function selectLevel(n: number): void {
@@ -136,6 +150,10 @@ function selectLevel(n: number): void {
   successModal = null;
   toast = null;
   drawLimit = null;
+  lastRunDoc = null;
+  dirty = false;
+  pendingCheck = false;
+  runCount = 0;
   undoStack = [];
   redoStack = [];
   persist();
@@ -169,7 +187,7 @@ function addBlock(kind: BlockKind): void {
   }
   if (kind === 'REPEAT') activeContainerId = block.id;
   selectedBlockId = block.id;
-  drawLimit = null;
+  markEdited();
   sfx.add();
   persist();
   render();
@@ -182,7 +200,7 @@ function removeBlock(id: string): void {
   found.list.splice(found.index, 1);
   if (selectedBlockId === id) selectedBlockId = null;
   if (activeContainerId === id) activeContainerId = null;
-  drawLimit = null;
+  markEdited();
   sfx.remove();
   persist();
   render();
@@ -196,6 +214,7 @@ function moveBlock(id: string, delta: number): void {
   pushUndo();
   const [item] = found.list.splice(found.index, 1);
   found.list.splice(to, 0, item);
+  markEdited();
   sfx.tweak();
   persist();
   render();
@@ -210,7 +229,7 @@ function adjustValue(id: string, delta: number, exact?: number): void {
   const max = b.kind === 'REPEAT' ? 72 : 360;
   b.sizeExpr = 'fixed';
   b.value = Math.max(min, Math.min(max, exact ?? (b.value ?? 0) + delta));
-  drawLimit = null;
+  markEdited();
   sfx.tweak();
   persist();
   render();
@@ -221,7 +240,7 @@ function setExpr(id: string, expr: SizeExpr): void {
   if (!found) return;
   pushUndo();
   found.block.sizeExpr = expr;
-  drawLimit = null;
+  markEdited();
   sfx.tweak();
   persist();
   render();
@@ -232,7 +251,7 @@ function setColor(id: string, c: PenColor): void {
   if (!found) return;
   pushUndo();
   found.block.color = c;
-  drawLimit = null;
+  markEdited();
   sfx.tweak();
   persist();
   render();
@@ -245,7 +264,7 @@ function undo(): void {
   doc = prev;
   selectedBlockId = null;
   activeContainerId = null;
-  drawLimit = null;
+  markEdited();
   persist();
   render();
 }
@@ -257,7 +276,7 @@ function redo(): void {
   doc = next;
   selectedBlockId = null;
   activeContainerId = null;
-  drawLimit = null;
+  markEdited();
   persist();
   render();
 }
@@ -268,17 +287,20 @@ function clearProgram(): void {
   doc = { main: [], myBlock: [], spin: doc.spin };
   selectedBlockId = null;
   activeContainerId = null;
+  lastRunDoc = null;
+  dirty = false;
+  pendingCheck = false;
   drawLimit = null;
   sfx.remove();
   persist();
   render();
 }
 
-function checkDrawing(): void {
-  const match = currentMatch();
+function finishCheck(): void {
+  const match = lastRunMatch();
   if (!match) return;
   if (match.passed) {
-    const blocks = countBlocks(doc);
+    const blocks = countBlocks(lastRunDoc ?? doc);
     const star = level.parBlocks !== undefined && blocks <= level.parBlocks;
     if (!save.completed.includes(level.number)) save.completed.push(level.number);
     const prev = save.bestBlocks[level.number];
@@ -290,9 +312,26 @@ function checkDrawing(): void {
     render();
   } else {
     sfx.fail();
-    showToast(`Almost! You're at ${match.score}% match — trace the dotted blueprint closely.`, 'error');
+    showToast(`Almost! ${match.score}% match — tweak your blocks and tap Run again.`, 'error');
     render();
   }
+}
+
+function runAndCheck(): void {
+  const total = currentRun().segments.length;
+  if (!total) {
+    showToast('Add some blocks first!');
+    render();
+    return;
+  }
+  lastRunDoc = cloneDoc(doc);
+  dirty = false;
+  runCount++;
+  drawLimit = 0;
+  pendingCheck = !level.sandbox;
+  toast = null;
+  render();
+  syncLoop();
 }
 
 function watchDraw(): void {
@@ -373,38 +412,50 @@ function paintCanvas(): void {
     c.restore();
   }
 
-  // Player drawing
-  const run = currentRun(doc.spin ? spinAngle : 0, doc.spin ? spinHue : 0);
-  const count = drawLimit === null ? run.segments.length : Math.min(run.segments.length, Math.floor(drawLimit));
+  // Player drawing: live in Sandbox, only after tapping Run in puzzle levels
+  const activeProgram = level.sandbox ? doc : lastRunDoc;
+  const run = activeProgram ? runDoc(activeProgram, doc.spin ? spinAngle : 0, doc.spin ? spinHue : 0) : null;
+  const totalSegs = run ? run.segments.length : 0;
+  const count = !run ? 0 : drawLimit === null ? totalSegs : Math.min(totalSegs, Math.floor(drawLimit));
 
+  c.save();
+  if (!level.sandbox && dirty) {
+    // Dim previous attempt while player is editing blocks
+    c.globalAlpha = 0.28;
+  }
   c.lineCap = 'round';
   c.lineJoin = 'round';
-  for (let i = 0; i < count; i++) {
-    const s = run.segments[i];
-    c.strokeStyle = s.color;
-    c.shadowColor = s.color;
-    c.shadowBlur = 10;
-    c.lineWidth = 3.5;
-    c.beginPath();
-    c.moveTo(s.x1, s.y1);
-    c.lineTo(s.x2, s.y2);
-    c.stroke();
+  if (run) {
+    for (let i = 0; i < count; i++) {
+      const s = run.segments[i];
+      c.strokeStyle = s.color;
+      c.shadowColor = s.color;
+      c.shadowBlur = 10;
+      c.lineWidth = 3.5;
+      c.beginPath();
+      c.moveTo(s.x1, s.y1);
+      c.lineTo(s.x2, s.y2);
+      c.stroke();
+    }
   }
   c.shadowBlur = 0;
+  c.restore();
 
-  // Turtle sprite at current head
+  // Turtle sprite at current head (or starting pose when waiting to Run)
   let tx = level.startX ?? 0;
   let ty = level.startY ?? 0;
   let ta = (level.startAngle ?? 0) + (doc.spin ? spinAngle : 0);
-  if (count > 0 && count < run.segments.length) {
-    const last = run.segments[count - 1];
-    tx = last.x2;
-    ty = last.y2;
-    ta = (Math.atan2(last.y2 - last.y1, last.x2 - last.x1) * 180) / Math.PI + 90;
-  } else if (count >= run.segments.length) {
-    tx = run.endPose.x;
-    ty = run.endPose.y;
-    ta = run.endPose.angle;
+  if (run && (!dirty || level.sandbox)) {
+    if (count > 0 && count < totalSegs) {
+      const last = run.segments[count - 1];
+      tx = last.x2;
+      ty = last.y2;
+      ta = (Math.atan2(last.y2 - last.y1, last.x2 - last.x1) * 180) / Math.PI + 90;
+    } else if (count >= totalSegs && totalSegs > 0) {
+      tx = run.endPose.x;
+      ty = run.endPose.y;
+      ta = run.endPose.angle;
+    }
   }
 
   c.save();
@@ -445,17 +496,24 @@ function syncLoop(): void {
       spinHue = (spinHue + 0.25) % 360;
       keepGoing = true;
     }
+    let finishedRun = false;
     if (drawLimit !== null) {
-      const total = currentRun().segments.length;
-      const speed = Math.max(0.4, total / 90);
+      const prog = level.sandbox ? doc : lastRunDoc;
+      const total = prog ? runDoc(prog).segments.length : 0;
+      const speed = Math.max(0.35, total / 70);
       drawLimit += speed;
       if (drawLimit >= total) {
         drawLimit = null;
+        finishedRun = true;
       } else {
         keepGoing = true;
       }
     }
     paintCanvas();
+    if (finishedRun && pendingCheck) {
+      pendingCheck = false;
+      finishCheck();
+    }
     if (keepGoing) animFrame = requestAnimationFrame(stepFrame);
     else animFrame = 0;
   };
@@ -649,16 +707,29 @@ function renderHelp(): string {
 }
 
 function render(): void {
-  const match = currentMatch();
+  const match = lastRunMatch();
+  let statusPill = '';
+  if (!level.sandbox) {
+    if (drawLimit !== null) {
+      statusPill = `<div class="match-pill">Drawing…</div>`;
+    } else if (match && !dirty) {
+      statusPill = `<div class="match-pill${match.passed ? ' good' : ''}">${match.score}% match · Run #${runCount}</div>`;
+    } else if (dirty && (doc.main.length || doc.myBlock.length)) {
+      statusPill = `<div class="match-pill">Edited · tap ▶ Run</div>`;
+    }
+  }
   app.innerHTML = `${renderHeader()}
   <main class="stage">
     <section class="canvas-wrap">
       <canvas class="studio-canvas"></canvas>
-      ${match ? `<div class="match-pill${match.passed ? ' good' : ''}">${match.score}% match</div>` : ''}
+      ${statusPill}
       ${toast ? `<div class="toast ${toast.kind}">${esc(toast.text)}</div>` : ''}
       <div class="canvas-bar">
-        ${!level.sandbox ? `<button class="bar-btn primary" data-action="check">✓ Check Drawing</button>` : ''}
-        <button class="bar-btn watch" data-action="watch">▶ Watch Draw</button>
+        ${
+          !level.sandbox
+            ? `<button class="bar-btn primary" data-action="run">▶ Run</button>`
+            : `<button class="bar-btn watch" data-action="watch">▶ Watch Draw</button>`
+        }
         ${level.allowSpin ? `<button class="bar-btn spin${doc.spin ? ' on' : ''}" data-action="toggle-spin">🌀 ${doc.spin ? 'Spinning' : 'Spin'}</button>` : ''}
         <button class="bar-btn" data-action="undo"${undoStack.length ? '' : ' disabled'}>Undo</button>
         <button class="bar-btn" data-action="redo"${redoStack.length ? '' : ' disabled'}>Redo</button>
@@ -703,7 +774,7 @@ app.addEventListener('click', event => {
   else if (action === 'undo') { undo(); }
   else if (action === 'redo') { redo(); }
   else if (action === 'clear') { clearProgram(); }
-  else if (action === 'check') { checkDrawing(); }
+  else if (action === 'run') { runAndCheck(); }
   else if (action === 'watch') { watchDraw(); }
   else if (action === 'toggle-spin') { doc.spin = !doc.spin; persist(); render(); syncLoop(); }
   else if (action === 'load-preset') {
